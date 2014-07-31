@@ -1,0 +1,3 @@
+include versioneer.py
+include sqlalchemy_exasol/_version.py
+include README.rst

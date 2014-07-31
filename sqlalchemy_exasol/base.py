@@ -46,6 +46,9 @@ representation (all uppercase).
 
 """
 
+import six
+if six.PY3:
+    from six import u as unicode
 from decimal import Decimal
 from sqlalchemy import sql, schema, types as sqltypes, util, event
 from sqlalchemy.schema import AddConstraint
@@ -113,19 +116,12 @@ RESERVED_WORDS = set([
 colspecs = {
 }
 
-
-class EXABOOLEAN(sqltypes.BOOLEAN):
-    """Because Exasol does not support CHECK constraints"""
-    def __init__(self, create_constraint=False, name=None):
-        super(EXABOOLEAN, self).__init__(create_constraint, name)
-
-
 ischema_names = {
-    'BOOLEAN': EXABOOLEAN,
+    'BOOLEAN': sqltypes.BOOLEAN,
     'CHAR': sqltypes.CHAR,
     'CLOB': sqltypes.TEXT,
     'DATE': sqltypes.DATE,
-    'DECIMAL': sqltypes.DECIMAL, 
+    'DECIMAL': sqltypes.DECIMAL,
     'DOUBLE': sqltypes.FLOAT,  # EXASOL mapps DOUBLE, DOUBLE PRECISION, FLOAT to DOUBLE PRECISION
                                  # internally but returns 'DOUBLE' as type when asking the DB catalog
     # INTERVAL DAY [(p)] TO SECOND [(fp)] TODO: missing support for EXA Datatype, check Oracle Engine
@@ -153,12 +149,6 @@ class EXACompiler(compiler.SQLCompiler):
 
     def visit_now_func(self, fn, **kw):
         return "CURRENT_TIMESTAMP"
-
-    def visit_true(self, expr, **kw):
-        return '1'
-
-    def visit_false(self, expr, **kw):
-        return '0'
 
     def visit_char_length_func(self, fn, **kw):
         return "length%s" % self.function_argspec(fn)
@@ -221,11 +211,12 @@ class EXADDLCompiler(compiler.DDLCompiler):
                 )
 
         for c in [c for c in table._sorted_constraints if c is not table.primary_key]:
-            event.listen(
-                table,
-                "after_create",
-                AddConstraint(c)
-            )
+            if c._create_rule is None or c._create_rule(self):
+                event.listen(
+                    table,
+                    "after_create",
+                    AddConstraint(c)
+                )
 
         return table_constraint_str
 
@@ -253,6 +244,7 @@ class EXATypeCompiler(compiler.GenericTypeCompiler):
 
 class EXAIdentifierPreparer(compiler.IdentifierPreparer):
     reserved_words = RESERVED_WORDS
+    illegal_initial_characters = compiler.ILLEGAL_INITIAL_CHARACTERS.union('_')
 
 
 class EXAExecutionContext(default.DefaultExecutionContext):
@@ -266,7 +258,7 @@ class EXAExecutionContext(default.DefaultExecutionContext):
         if column.default.is_sequence:
             return 'DEFAULT'
         else:
-            return super(EXAExecutionContext, self).get_insert_default(self, column)
+            return super(EXAExecutionContext, self).get_insert_default(column)
 
     def get_lastrowid(self):
         columns = self.compiled.sql_compiler.statement.table.columns
@@ -280,24 +272,24 @@ class EXAExecutionContext(default.DefaultExecutionContext):
             raise Exception
         else:
             id_col = self.dialect.denormalize_name(autoinc_pk_columns[0])
-            id_col = self.compiled.render_literal_value(id_col, None)
 
             table = self.compiled.sql_compiler.statement.table.name
             table = self.dialect.denormalize_name(table)
-            table = self.compiled.render_literal_value(table, None)
 
             sql_stmnt = "SELECT column_identity from SYS.EXA_ALL_COLUMNS "\
                         "WHERE column_object_type = 'TABLE' and column_table "\
-                        "= " + table + " AND column_name = " + id_col
+                        "= ? AND column_name = ?"
 
             schema = self.compiled.sql_compiler.statement.table.schema
             if schema is not None:
                 schema = self.dialect.denormalize_name(schema)
-                schema = self.compiled.render_literal_value(schema, None)
-                sql_stmnt += " AND column_schema = " + schema
+                sql_stmnt += " AND column_schema = ?"
 
             cursor = self.create_cursor()
-            cursor.execute(sql_stmnt)
+            if schema:
+                cursor.execute(sql_stmnt, table, id_col, schema)
+            else:
+                cursor.execute(sql_stmnt, table, id_col)
             lastrowid = cursor.fetchone()[0] - 1
             cursor.close()
             return lastrowid
@@ -318,7 +310,7 @@ class EXAExecutionContext(default.DefaultExecutionContext):
                     ident = '?'
                     if value is None:
                         db_query = db_query.replace(ident, 'NULL', 1)
-                    elif isinstance(value, (int, long)):
+                    elif isinstance(value, six.integer_types):
                         db_query = db_query.replace(ident, str(value), 1)
                     elif isinstance(value, (float, Decimal)):
                         db_query = db_query.replace(ident, str(float(value)), 1)
@@ -340,6 +332,7 @@ class EXAExecutionContext(default.DefaultExecutionContext):
 
 class EXADialect(default.DefaultDialect):
     name = 'exasol'
+    supports_native_boolean = True
     supports_alter = True
     supports_unicode_statements = True
     supports_unicode_binds = True
@@ -370,6 +363,12 @@ class EXADialect(default.DefaultDialect):
         'SERIALIZABLE': 0
     }
 
+    def _get_default_schema_name(self, connection):
+        """
+        Using 'SYS' as default schema. Tables in 'SYS' are not reflectable!
+        """
+        return u"SYS"
+
     def normalize_name(self, name):
         """
         Converting EXASol case insensitive identifiers (upper case)
@@ -377,10 +376,11 @@ class EXADialect(default.DefaultDialect):
         """
         if name is None:
             return None
-        # Py2K
-        if isinstance(name, str):
-            name = name.decode(self.encoding)
-        # end Py2K
+
+        if six.PY2:
+            if isinstance(name, str):
+                name = name.decode(self.encoding)
+
         if name.upper() == name and \
               not self.identifier_preparer._requires_quotes(name.lower()):
             return name.lower()
@@ -397,12 +397,13 @@ class EXADialect(default.DefaultDialect):
         elif name.lower() == name and \
                 not self.identifier_preparer._requires_quotes(name.lower()):
             name = name.upper()
-        # Py2K
-        if not self.supports_unicode_binds:
-            name = name.encode(self.encoding)
-        else:
-            name = unicode(name)
-        # end Py2K
+
+        if six.PY2:
+            if not self.supports_unicode_binds:
+                name = name.encode(self.encoding)
+            else:
+                name = unicode(name)
+
         return name
 
     def get_isolation_level(self, connection):
@@ -525,7 +526,7 @@ class EXADialect(default.DefaultDialect):
                 'default': default
             }
             # if we have a positive identity value add a sequence
-            if identity >= 0:
+            if identity is not None and identity >= 0:
                 cdict['sequence'] = {'name':''}
                 # TODO: we have to possibility to encode the current identity value count
                 # into the column metadata. But the consequence is that it would also be used
@@ -597,7 +598,7 @@ class EXADialect(default.DefaultDialect):
                 # we need to take care of calls without schema. the sqla test suite
                 # expects referred_schema to be None if None is passed in to this function
                 if schema is None and schema_int == self.normalize_name(remote_schema):
-                    rec['referred_schema'] = None 
+                    rec['referred_schema'] = None
                 else:
                     rec['referred_schema'] = self.normalize_name(remote_schema)
 
